@@ -1,0 +1,358 @@
+# Keep all your previous imports unchanged
+import requests
+import json
+import os
+import time
+import datetime
+import webbrowser
+import html as _html
+from pathlib import Path
+from collections import defaultdict
+from dotenv import load_dotenv
+import re
+
+# ================================================================
+# Configuration
+# ================================================================
+BASE_DIR = Path("C:/Users/ADMIN/PycharmProjects/API Automation")
+JSON_DIR = BASE_DIR / "apipayload/one api"
+REPORTS_DIR = BASE_DIR / "reports"
+REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+RESULT_FILE = REPORTS_DIR / "latest_results.json"
+
+# Load .env if present
+ENV_PATH = BASE_DIR / ".env"
+if ENV_PATH.exists():
+    load_dotenv(dotenv_path=str(ENV_PATH))
+else:
+    load_dotenv()  # fallback to cwd
+
+# Performance threshold (ms)
+GLOBAL_PERF_THRESHOLD_MS = 1500
+
+# Control partial message matching
+ALLOW_PARTIAL_MESSAGE_MATCH = os.getenv("ALLOW_PARTIAL_MESSAGE_MATCH", "false").lower() == "true"
+
+# ================================================================
+# Tokens: fetch from /auth/login API
+# ================================================================
+def get_tokens_from_api():
+    login_url = os.getenv("LOGIN_API_URL", "http://34.47.192.60/auth/login")
+    payload = {
+        "username": os.getenv("LOGIN_USER"),
+        "password": os.getenv("LOGIN_PASS")
+    }
+
+    if not payload["username"] or not payload["password"]:
+        print("❌ LOGIN_USER or LOGIN_PASS missing in .env")
+        return {"access_token": "", "id_token": "", "refresh_token": ""}
+
+    headers = {"Content-Type": "application/json"}
+
+    print("🔐 Calling /auth/login API to fetch tokens...")
+    try:
+        resp = requests.post(login_url, json=payload, headers=headers, timeout=int(os.getenv("REQUEST_TIMEOUT", 15)))
+        resp.raise_for_status()
+        data = resp.json()
+        print("✅ Tokens fetched successfully from API.")
+        return {
+            "access_token": data.get("access_token", ""),
+            "id_token": data.get("id_token", ""),
+            "refresh_token": data.get("refresh_token", "")
+        }
+    except Exception as e:
+        print(f"❌ Failed to fetch tokens: {e}")
+        return {"access_token": "", "id_token": "", "refresh_token": ""}
+
+
+def deterministic_dummy_id_token(seed_value: str) -> str:
+    return f"dummy-id-{abs(hash(seed_value)) % (10 ** 12)}"
+
+
+def redact_headers(headers):
+    redacted = {}
+    for k, v in (headers or {}).items():
+        if k and k.lower() in ("authorization", "token", "x-api-key", "x-access-token", "x-id-token"):
+            redacted[k] = "***redacted***"
+        else:
+            redacted[k] = v
+    return redacted
+
+
+# ================================================================
+# Response Validation
+# ================================================================
+def validate_response_simple(resp_json, expected_response, query_content=None, test_type=None):
+    errors = []
+
+    if not isinstance(resp_json, dict):
+        errors.append("Response is not a JSON object")
+        return False, errors
+
+    # Match top-level fields (status, message)
+    for key in ("status", "message"):
+        if key in expected_response:
+            expected_value = str(expected_response[key])
+            actual_value = str(resp_json.get(key, ""))
+            if ALLOW_PARTIAL_MESSAGE_MATCH:
+                if expected_value not in actual_value:
+                    errors.append(f"Expected '{key}' to contain: {expected_value}, got: {actual_value}")
+            else:
+                if expected_value != actual_value:
+                    errors.append(f"Expected '{key}': {expected_value}, got: {actual_value}")
+
+    # Content match in farmer_full_name (only for non-authentication test types)
+    if query_content and test_type and "authentication" not in test_type.lower():
+        data_list = resp_json.get("data", [])
+        if isinstance(data_list, list):
+            matched = any(
+                query_content.lower() in str(item.get("farmer_full_name", "")).lower()
+                for item in data_list if isinstance(item, dict)
+            )
+            if not matched:
+                errors.append(f"Query content '{query_content}' not found in any farmer_full_name in response data")
+        else:
+            errors.append("Response 'data' is not a list")
+
+    return (len(errors) == 0), errors
+
+
+# ================================================================
+# Test Execution
+# ================================================================
+SUMMARY = {"total": 0, "passed": 0, "failed": 0, "skipped": 0, "results": []}
+
+
+def run_all_tests():
+    TOKENS = get_tokens_from_api()
+    overall_start = time.time()
+
+    print("🔹 Starting GET API tests...\n")
+
+    for json_file in JSON_DIR.rglob("*.json"):
+        print(f"Loading JSON file: {json_file}")
+        try:
+            with open(json_file, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception as e:
+            print(f"❌ Failed to load JSON: {e}")
+            continue
+
+        base_url = data.get("base_url", os.getenv("BASE_URL", "")).rstrip("/")
+        default_method = data.get("method", "GET").upper()
+        file_headers = data.get("headers", {}) or {}
+        tokens_dict = data.get("tokens", {}) or {}
+
+        if TOKENS.get("access_token"):
+            tokens_dict["valid"] = TOKENS["access_token"]
+        if TOKENS.get("id_token"):
+            tokens_dict["valid_id"] = TOKENS["id_token"]
+
+        for idx, case in enumerate(data.get("test_cases", []) or [], 1):
+            test_id = case.get("test_id", f"{json_file.stem}_{idx:03d}")
+            desc = case.get("description", "-")
+            test_type = case.get("type", "")
+            method = case.get("method", default_method).upper()
+            endpoint = case.get("endpoint") or case.get("api_endpoint")
+
+            print(f"Processing test: {test_id}, method: {method}, endpoint: {endpoint}")
+
+            SUMMARY["total"] += 1
+
+            if not endpoint:
+                print(f"⚠️ Skipping {test_id} → Missing endpoint")
+                SUMMARY["skipped"] += 1
+                SUMMARY["results"].append({
+                    "id": test_id, "desc": desc, "status_code": "-", "result": "SKIPPED",
+                    "details": "Missing endpoint", "api_name": "Unknown", "method": "", "endpoint": ""
+                })
+                continue
+
+            if method != "GET":
+                print(f"⚠️ Skipping {test_id} → Non-GET method ({method})")
+                SUMMARY["skipped"] += 1
+                SUMMARY["results"].append({
+                    "id": test_id, "desc": desc, "status_code": "-", "result": "SKIPPED",
+                    "details": f"Skipped non-GET method ({method})", "api_name": f"{method} {endpoint}",
+                    "method": method, "endpoint": endpoint
+                })
+                continue
+
+            headers = {**file_headers, **(case.get("headers", {}) or {}), "Accept": "/json"}
+            params = case.get("query_params", {}) or {}
+
+            path_params = case.get("path_params", {}) or {}
+            for ph in re.findall(r"\{(\w+)\}", endpoint):
+                if ph in path_params:
+                    endpoint = endpoint.replace(f"{{{ph}}}", str(path_params[ph]))
+
+            url = f"{base_url}{endpoint}"
+
+            token_key = case.get("auth_token", "valid")
+            access_token_value = tokens_dict.get(token_key, "")
+            id_token_key = f"{token_key}_id"
+            id_token_value = tokens_dict.get(id_token_key)
+            if token_key != "empty" and not id_token_value:
+                seed = f"{json_file}:{token_key}:{access_token_value}"
+                id_token_value = deterministic_dummy_id_token(seed)
+                tokens_dict[id_token_key] = id_token_value
+
+            if token_key == "empty":
+                headers.pop("Authorization", None)
+                headers.pop("X-ID-Token", None)
+            else:
+                if access_token_value:
+                    headers["Authorization"] = f"Bearer {access_token_value}"
+                if id_token_value:
+                    headers["X-ID-Token"] = id_token_value
+
+            start = time.perf_counter()
+            try:
+                resp = requests.get(url, headers=headers, params=params, timeout=30)
+                elapsed_ms = int((time.perf_counter() - start) * 1000)
+                status_code = resp.status_code
+
+                try:
+                    resp_json = resp.json()
+                    resp_body = json.dumps(resp_json, indent=2, ensure_ascii=False)
+                except Exception:
+                    resp_json = {}
+                    resp_body = resp.text or ""
+
+                test_passed = True
+                errors = []
+
+                expected_status = case.get("expected_status")
+                if expected_status and status_code != expected_status:
+                    test_passed = False
+                    errors.append(f"Expected {expected_status}, got {status_code}")
+
+                expected_resp = case.get("expected_response") or case.get("expected_response_options")
+                query_content = params.get("content")
+                if expected_resp:
+                    valid, err = validate_response_simple(resp_json, expected_resp, query_content=query_content,
+                                                          test_type=test_type)
+                    if not valid:
+                        test_passed = False
+                        errors.extend(err)
+
+                slow_flag = f" → ⚠️ Slow ({elapsed_ms} > {GLOBAL_PERF_THRESHOLD_MS} ms)" if elapsed_ms > GLOBAL_PERF_THRESHOLD_MS else " → ✅ OK"
+                request_display = json.dumps(params, indent=2) if params else "-"
+                resp_body_pretty = _html.escape(resp_body)
+                error_section = f"<div style='color:red;font-weight:bold;'>Errors: {json.dumps(errors, indent=2)}</div>" if errors else ""
+
+                details_html = f"""
+<pre>
+=== Request {test_id} ===
+Scenario: {desc}
+URL: {method} {url}
+Headers: {redact_headers(headers)}
+{_html.escape(request_display)}
+
+--- Response {test_id} ---
+Status: {status_code}
+Time: {elapsed_ms} ms{slow_flag}
+Body:
+{resp_body_pretty}
+</pre>
+{error_section}
+<pre>
+{'✅ PASSED' if test_passed else '❌ FAILED'} {test_id}
+</pre>
+"""
+
+                SUMMARY["results"].append({
+                    "id": test_id,
+                    "desc": desc,
+                    "status_code": status_code,
+                    "result": "PASS" if test_passed else "FAIL",
+                    "details": details_html,
+                    "api_name": f"{method} {endpoint}",
+                    "method": method,
+                    "endpoint": endpoint
+                })
+
+                if test_passed:
+                    SUMMARY["passed"] += 1
+                else:
+                    SUMMARY["failed"] += 1
+
+            except Exception as e:
+                elapsed_ms = int((time.perf_counter() - start) * 1000)
+                SUMMARY["failed"] += 1
+                SUMMARY["results"].append({
+                    "id": test_id,
+                    "desc": desc,
+                    "status_code": "ERROR",
+                    "result": "FAIL",
+                    "details": f"<pre>Exception: {_html.escape(str(e))}</pre>",
+                    "api_name": f"{method} {endpoint}",
+                    "method": method,
+                    "endpoint": endpoint
+                })
+                print(f"❌ Test {test_id} failed: {e}")
+
+    overall_duration = int((time.time() - overall_start) * 1000)
+    print(f"\n🔹 All GET tests completed in {overall_duration} ms")
+    print(
+        f"Total: {SUMMARY['total']}, Passed: {SUMMARY['passed']}, Failed: {SUMMARY['failed']}, Skipped: {SUMMARY['skipped']}")
+    return SUMMARY
+
+
+# ================================================================
+# HTML Report Generator
+# ================================================================
+def generate_html(summary):
+    total = summary.get("total", 0)
+    passed = summary.get("passed", 0)
+    failed = summary.get("failed", 0)
+    skipped = summary.get("skipped", 0)
+    results = summary.get("results", [])
+
+    html_parts = [
+        "<html><head><title>API Test Report</title>",
+        "<style>",
+        "body { font-family: Arial, sans-serif; background: #f9f9f9; color: #333; }",
+        "h1 { text-align: center; }",
+        ".summary { margin: 20px; padding: 10px; background: #eaeaea; border-radius: 8px; }",
+        ".results { margin: 20px; }",
+        ".test { margin-bottom: 20px; padding: 10px; background: white; border-radius: 8px; box-shadow: 0 0 5px #ccc; }",
+        ".pass { color: green; font-weight: bold; }",
+        ".fail { color: red; font-weight: bold; }",
+        ".skip { color: orange; font-weight: bold; }",
+        "</style>",
+        "</head><body>",
+        "<h1>API Test Report</h1>",
+        "<div class='summary'>",
+        f"<p><strong>Total Tests:</strong> {total}</p>",
+        f"<p><span class='pass'>Passed:</span> {passed}</p>",
+        f"<p><span class='fail'>Failed:</span> {failed}</p>",
+        f"<p><span class='skip'>Skipped:</span> {skipped}</p>",
+        "</div>",
+        "<div class='results'>"
+    ]
+
+    for r in results:
+        status_class = "pass" if r["result"] == "PASS" else ("fail" if r["result"] == "FAIL" else "skip")
+        html_parts.append(f"<div class='test'>")
+        html_parts.append(f"<h3>{r['id']} - {r['desc']}</h3>")
+        html_parts.append(f"<p>Status: <span class='{status_class}'>{r['result']}</span></p>")
+        html_parts.append(f"<p>API: {r['api_name']}</p>")
+        html_parts.append(f"{r['details']}")
+        html_parts.append("</div>")
+
+    html_parts.append("</div></body></html>")
+
+    return "\n".join(html_parts)
+
+
+# Entry point
+if __name__ == "__main__":
+    final_summary = run_all_tests()
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    report_file = REPORTS_DIR / f"api_report_{timestamp}.html"
+    html = generate_html(final_summary)
+    report_file.write_text(html, encoding="utf-8")
+    print(f"\n✅ HTML report generated successfully: {report_file}")
+    webbrowser.open(report_file.as_uri())
